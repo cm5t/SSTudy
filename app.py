@@ -190,16 +190,16 @@ data = DataManager()
 # --- CSS & Layout ---
 st.markdown("""
     <style>
-    .main-header { font-size: 2.3rem; color: #4C51BF; font-weight: bold}
+    .main-header { font-size: 3.15rem; color: #4C51BF; font-weight: bold}
     
     .note-card {
         background-color: #898989 !important;
         border: 1px solid #e2e8f0 !important;
-        border-radius: 12px !important;
+        border-radius: 8px !important;
         padding: 24px !important;
         color: #000000 !important;
-        height: 282px;
         display: flex;
+        height: 250px;
         flex-direction: column;
         justify-content: flex-start;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
@@ -239,7 +239,7 @@ st.markdown("""
         -webkit-box-orient: vertical;
         overflow: hidden;
         text-overflow: ellipsis;
-        margin-bottom: 20px;
+        margin-bottom: 8px;
         word-break: break-all; /* FORCES wrapping for strings without spaces */
         overflow-wrap: break-word;
     }
@@ -251,12 +251,31 @@ st.markdown("""
         border: 1px solid #d1d5db !important;
         border-radius: 8px !important;
         width: 100% !important;
-        padding: 10px !important;
+        padding: 6px !important;
         font-weight: 600 !important;
+        margin-bottom: 0px !important;
     }
     
     div[data-testid="stButton"] button:hover {
         background-color: #d1d5db !important;
+    }
+
+    /* Double font size for Tabs, Expanders, and Labels */
+    button[data-testid="stTab"] p { font-size: 1.5rem !important; }
+    div[data-testid="stExpander"] p { font-size: 1.5rem !important; }
+    label[data-testid="stWidgetLabel"] p { font-size: 1.5rem !important; }
+    
+    /* Input fields themselves */
+    div[data-testid="stForm"] input, div[data-testid="stForm"] textarea, div[data-testid="stForm"] div[role="combobox"] {
+        font-size: 1.2rem !important;
+    }
+
+    /* Leaderboard font scaling */
+    .leaderboard-row {
+        font-size: 1.5rem !important;
+    }
+    .leaderboard-rank {
+        font-size: 1.8rem !important;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -317,7 +336,7 @@ with tab1:
                                 <div class="note-author">By {note['author']}</div>
                                 <div class="note-tag">{note['subject']} • {", ".join(note["level"]) if note["level"] else ""}</div>
                                 <div class="note-description">{note['description'] or "No description provided."}</div>
-                                <div style="margin-top: auto;">
+                                <div style="margin-top: 0px;">
                         """, unsafe_allow_html=True)
                         
                         # Buttons inside the auto-pushed bottom area
@@ -326,7 +345,6 @@ with tab1:
                             # Append ?download= to force browser download instead of opening in tab
                             download_url = f"{note['file']}?download="
                             st.link_button(f"⬇️ Download {f_name}", download_url, use_container_width=True)
-                        
                         has_liked = note['id'] in st.session_state.user_likes
                         btn_text = f"❤️ {note['likes']} Like" if not has_liked else f"💖 {note['likes']} Liked"
                         
@@ -349,9 +367,9 @@ with tab2:
         
         with st.container(border=True):
              c1, c2, c3 = st.columns([1, 4, 1])
-             c1.subheader(icon)
-             c2.markdown(f"**{user['username']}**")
-             c3.markdown(f"**{user['points']} pts**")
+             c1.markdown(f'<div class="leaderboard-rank">{icon}</div>', unsafe_allow_html=True)
+             c2.markdown(f'<div class="leaderboard-row"><b>{user["username"]}</b></div>', unsafe_allow_html=True)
+             c3.markdown(f'<div class="leaderboard-row"><b>{user["points"]} pts</b></div>', unsafe_allow_html=True)
 
 # --- AI Tutor Tab ---
 with tab3:
