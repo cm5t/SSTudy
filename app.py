@@ -90,6 +90,9 @@ class DataManager:
     def signup(self, email, username, password):
         try:
             # Check if user exists (username OR email)
+            if not (3 <= len(username) <= 36):
+                return False, "Username must be between 3 and 36 characters."
+
             existing_user = supabase.table("users").select("*").eq("username", username).execute()
             if existing_user.data:
                 return False, "Username already taken."
