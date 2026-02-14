@@ -525,6 +525,14 @@ if st.session_state.user is None:
     except Exception as e:
         st.error(f"Could not load Google Sign‑In: {e}")
 
+    # ---------- OAuth Troubleshooting Diagnostics ----------
+    with st.expander("🛠️ OAuth Troubleshooter"):
+        st.write("Cross-check these values with your dashboards:")
+        st.code(f"App Redirect URL: {get_base_url()}")
+        st.write("1. **Google Cloud**: The 'Authorized redirect URI' must be the **Supabase** callback URL (found in Supabase > Authentication > Providers > Google).")
+        st.write("2. **Supabase**: The 'Redirect URL' in Supabase URL Configuration must be the **App Redirect URL** shown above.")
+        st.write("3. **Google Cloud**: Ensure 'User Type' is set to **External** on the OAuth consent screen.")
+
     # ---------- Email/Password Tabs ----------
     tab_login, tab_signup = st.tabs(["Sign In", "Sign Up"])
 
