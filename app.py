@@ -815,7 +815,7 @@ else:
                 else:
                     score_color = "#888"
                     score_text = "0"
-                st.markdown(f"**Votes:** <span style='color: {score_color}; font-weight: bold; font-size: 1.2rem;'>{score_text}</span>", unsafe_allow_html=True)
+                st.markdown(f"**Score:** <span style='color: {score_color}; font-weight: bold; font-size: 1.2rem;'>{score_text}</span>", unsafe_allow_html=True)
 
                 st.markdown("---")
                 st.markdown(note['description'] or "No description provided.")
