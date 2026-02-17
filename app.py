@@ -1,27 +1,43 @@
+# ======================================================================
+# SST Study Sphere — A study notes sharing platform for SST students.
+# Built with Streamlit (frontend) and Supabase (backend database + storage).
+# ======================================================================
+
 import streamlit as st
-from supabase import create_client, Client, ClientOptions
+
+# Initialize user session state before any other imports to avoid issues
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+from supabase import create_client, Client
 import mimetypes
 import math
 import hashlib
 import time
+import google.generativeai as genai
+import io
 
 
 # ----------------------------------------------------------------------
-# Helper functions (unchanged)
+# Utility Functions
+# General-purpose helpers used across the application.
 # ----------------------------------------------------------------------
-def format_size(bytes):
-    if bytes == 0:
+def format_size(size_bytes):
+    """Convert a byte count into a human-readable string (e.g. '2.5 MB')."""
+    if size_bytes == 0:
         return "0B"
-    size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.floor(math.log(bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(bytes / p, 2)
-    return f"{s} {size_name[i]}"
+    size_units = ("B", "KB", "MB", "GB", "TB")
+    unit_index = int(math.floor(math.log(size_bytes, 1024)))
+    unit_value = math.pow(1024, unit_index)
+    rounded_size = round(size_bytes / unit_value, 2)
+    return f"{rounded_size} {size_units[unit_index]}"
 
 def calculate_level(xp):
+    """Derive user level from their XP using a square-root curve."""
     return math.floor(math.sqrt(xp / 50))
 
 def calculate_next_level_xp(level):
+    """Calculate the total XP needed to reach the next level."""
     return 50 * ((level + 1) ** 2)
 
 # ----------------------------------------------------------------------
@@ -30,32 +46,26 @@ def calculate_next_level_xp(level):
 st.set_page_config(page_title="SST Study Sphere", page_icon="🏫", layout="wide")
 
 # ----------------------------------------------------------------------
-# Custom Storage for Streamlit (persists PKCE verifier across redirects)
+# Persistent Session Storage
+# Saves and loads user session data to auth_token.json for auto-login.
 # ----------------------------------------------------------------------
-class StreamlitSessionStorage:
-    def get_item(self, key: str) -> str:
-        # Check both with and without prefix for compatibility
-        val = st.session_state.get(f"sb_{key}") or st.session_state.get(key)
-        return val
-    def set_item(self, key: str, value: str) -> None:
-        # Store in both places to ensure it's found regardless of prefixing
-        st.session_state[f"sb_{key}"] = value
-        st.session_state[key] = value
-    def remove_item(self, key: str) -> None:
-        st.session_state.pop(f"sb_{key}", None)
-        st.session_state.pop(key, None)
+import os
+import json
+
+SESSION_FILE = "auth_token.json"
+
 
 # ----------------------------------------------------------------------
-# Supabase client – stored in session_state to survive OAuth redirect
+# Supabase Client Setup
+# Creates and caches the Supabase client in session_state.
 # ----------------------------------------------------------------------
 def get_supabase():
-    """Return Supabase client, stored in session_state to preserve PKCE verifier."""
+    """Return Supabase client, cached in session_state across reruns."""
     if 'supabase_client' not in st.session_state:
         try:
             st.session_state.supabase_client = create_client(
                 st.secrets["supabase"]["url"],
-                st.secrets["supabase"]["key"],
-                options=ClientOptions(storage=StreamlitSessionStorage())
+                st.secrets["supabase"]["key"]
             )
         except Exception as e:
             st.error(f"Failed to connect to Supabase: {e}")
@@ -65,10 +75,204 @@ def get_supabase():
 supabase = get_supabase()
 
 # ----------------------------------------------------------------------
-# Storage bucket setup
+# Gemini AI Setup
+# Configures the Google Generative AI SDK for content moderation (tagging)
+# and the AI Study Buddy feature. The API key is read from secrets.toml.
+# HAS_AI is True if configuration succeeded, False otherwise.
+# ----------------------------------------------------------------------
+def init_gemini():
+    """Attempt to configure the Gemini AI SDK. Returns True on success."""
+    try:
+        api_key = None
+        if "GOOGLE_API_KEY" in st.secrets:
+            api_key = st.secrets["GOOGLE_API_KEY"]
+        elif "supabase" in st.secrets and "GOOGLE_API_KEY" in st.secrets["supabase"]:
+            api_key = st.secrets["supabase"]["GOOGLE_API_KEY"]
+
+        if api_key:
+            genai.configure(api_key=api_key, transport='rest')
+            return True
+        return False
+    except Exception as e:
+        print(f"init_gemini error: {e}")
+        return False
+
+HAS_AI = init_gemini()
+
+def get_ai_tagging(description, file_bytes=None, mime_type=None):
+    """Use Gemini AI to auto-detect Subject, Level, and content suitability.
+    Returns (subject, level, is_suitable). Tries multiple model fallbacks.
+    """
+    if not HAS_AI:
+        return "AI Not Configured", "AI Not Configured", True
+    
+    models_to_try = [
+        'gemini-2.5-flash-lite', 
+        'gemini-2.0-flash', 
+        'gemini-2.0-flash-lite', 
+        'gemini-2.5-flash'
+    ]
+    
+    response_text = None
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            
+            prompt = """
+            Analyze the following study note content and/or description for a study notes platform (SST Study Sphere).
+            
+            Tasks:
+            1. Determine if the content is "Suitable" for a study notes sharing site. 
+               - Suitable: Study notes, questions, guides, school projects, academic discussions.
+               - Unsuitable: Memes, jokes, random images, spam, off-topic content.
+            2. If suitable, determine the most appropriate 'Subject' and 'Level' from the lists.
+               Subjects: ['English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers']
+               Levels: ['Sec 1', 'Sec 2', 'Sec 3', 'Sec 4']
+            
+            Rules:
+            1. 'Changemakers' is ONLY for 'Sec 1' or 'Sec 2'.
+            2. 'Computing', 'Biotechnology', 'Design Studies', 'Electronics' are ONLY for 'Sec 3' or 'Sec 4'.
+            3. If the content is Unsuitable, still try to pick the closest Subject/Level if possible, but clearly mark it as Unsuitable.
+            
+            Return the result in this exact format:
+            Suitability: [Suitable/Unsuitable]
+            Subject: [Subject]
+            Level: [Level]
+            """
+            
+            content = [prompt]
+            if description:
+                content.append(f"Description: {description}")
+            
+            if file_bytes and mime_type:
+                 if mime_type.startswith('image/') or mime_type == 'application/pdf':
+                      content.append({"mime_type": mime_type, "data": file_bytes})
+
+            response = model.generate_content(content)
+            response_text = response.text
+            break 
+        except Exception as e:
+            last_error = str(e)
+            continue
+            
+    if not response_text:
+        st.error(f"GenAI Error (All models tried): {last_error}")
+        return None, None, True
+
+    # Parse response_text
+    suitability = "Suitable"
+    subject = "Math"
+    level = "Sec 1"
+    
+    for line in response_text.split('\n'):
+        if "Suitability:" in line:
+            suitability = line.split("Suitability:")[1].strip()
+        elif "Subject:" in line:
+            subject = line.split("Subject:")[1].strip()
+        elif "Level:" in line:
+            level = line.split("Level:")[1].strip()
+            
+    valid_subjects = ['English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers']
+    valid_levels = ['Sec 1', 'Sec 2', 'Sec 3', 'Sec 4']
+    
+    subject = subject.replace("*", "").replace("`", "")
+    level = level.replace("*", "").replace("`", "")
+    is_suitable = "unsuitable" not in suitability.lower()
+
+    if subject not in valid_subjects: subject = "Math"
+    if level not in valid_levels: level = "Sec 1"
+    
+    return subject, level, is_suitable
+
+
+def ai_study_buddy(topic, subject):
+    """Generate a study guide by fetching relevant notes from the database
+    and feeding them to Gemini AI along with the user's topic and subject.
+    Returns the AI-generated study guide as a markdown string.
+    """
+    if not HAS_AI:
+        return "AI is not configured. Please add GOOGLE_API_KEY to secrets."
+        
+    # 1. Pre-calculate content items (do this once)
+    try:
+        notes = supabase.table("projects").select("*").eq("subject", subject).ilike("title", f"%{topic}%").limit(3).execute().data
+        if not notes:
+             notes = supabase.table("projects").select("*").eq("subject", subject).limit(2).execute().data
+            
+        language_prompts = {
+            'Chinese': "Please respond entirely in Chinese (简体中文).",
+            'Malay': "Please respond entirely in Malay (Bahasa Melayu).",
+            'Tamil': "Please respond entirely in Tamil (தமிழ்).",
+        }
+        lang_instruction = language_prompts.get(subject, "Please respond in English.")
+
+        content_items = []
+        prompt_intro = f"""
+        You are an AI Study Buddy for Singapore Secondary School students (SST).
+        User wants to study: '{topic}' in Subject: '{subject}'.
+        
+        CONTEXT: 
+        1. Frame all academic explanations within the context of the GCSE O-Level examination standards.
+        2. {lang_instruction}
+        
+        RULES:
+        1. STRICT SOURCE USAGE: Analyze the provided note contents (descriptions and actual files).
+        2. Only pick information from the provided sources. Do NOT create your own sources or hallucinate non-existent files. If said topic is not found in the sources, just recommend other platforms - Google Classroom or Holy Grail.
+        3. If the provided notes are insufficient, you may provide general academic research for '{topic}' but CLEARLY LABEL it as "General Research" and distinguish it from the user's notes.
+        4. Summarize key points, provide a comprehensive study guide, and highlight specific details from the user's notes.
+        5. Format with clear headings, bullet points, and a friendly tone.
+        6. IF THERE IS NO SOURCES ON THAT PARTICULAR SUBJECT, JUST SAY 'There are no sources in [SUBJECT]. Please add your notes to that subject, and other notes to other subjects so others do not face the same difficulty!'
+        7. If said topic is off-topic, also provide a warning like 'This source seems to be off-topic. Please only ask for study-related content. If you think this is a bug, please rephrase or simplify the sentence.'
+        """
+        content_items.append(prompt_intro)
+
+        for note in notes:
+            text_context = f"Note Title: {note['title']}\nDescription: {note['description']}\n"
+            content_items.append(text_context)
+            
+            if note.get('file') and note['file'] != "#":
+                try:
+                    url = note['file']
+                    if "/public/file/" in url:
+                        storage_path = url.split("/public/file/")[1]
+                        file_data = supabase.storage.from_("file").download(storage_path)
+                        m_type, _ = mimetypes.guess_type(note.get('file_name', ''))
+                        if m_type and (m_type.startswith('image/') or m_type == 'application/pdf'):
+                            content_items.append({"mime_type": m_type, "data": file_data})
+                except Exception as file_err:
+                    print(f"Error downloading file for AI: {file_err}")
+    except Exception as e:
+        return f"Error gathering context: {e}"
+
+    # 2. Try models in order
+    models_to_try = [
+        'gemini-2.5-flash-lite', 
+        'gemini-2.0-flash', 
+        'gemini-2.0-flash-lite', 
+        'gemini-2.5-flash'
+    ]
+    last_err = ""
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(content_items)
+            return response.text
+        except Exception as e:
+            last_err = str(e)
+            continue
+            
+    return f"Error generating study guide (Tried all models): {last_err}"
+
+
+# ----------------------------------------------------------------------
+# Storage Bucket Setup
+# Ensures the Supabase Storage bucket for uploaded files exists.
+# Cached so it only runs once per app session.
 # ----------------------------------------------------------------------
 @st.cache_resource
 def get_or_create_bucket():
+    """Return the name of the file storage bucket, creating it if needed."""
     bucket_name = "file"
     try:
         buckets = supabase.storage.list_buckets()
@@ -82,14 +286,18 @@ def get_or_create_bucket():
 BUCKET_NAME = get_or_create_bucket()
 
 # ----------------------------------------------------------------------
-# Cached data fetchers
+# Cached Data Fetchers
+# These functions query Supabase and cache results using Streamlit's
+# @st.cache_data to avoid redundant database calls on every rerun.
+# Call .clear() on any of these to invalidate the cache after mutations.
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=1)
+@st.cache_data(ttl=60)
 def fetch_projects(query, subject, level, sort_by):
+    """Fetch notes from the 'projects' table with optional filters and sorting."""
     db_query = supabase.table("projects").select("*")
-    if sort_by == "Most Likes":
-        db_query = db_query.order("likes", desc=True)
-    else:  # Recent
+    if sort_by == "Most Votes":
+        db_query = db_query.order("votes", desc=True)
+    else:  # Default: most recent first
         db_query = db_query.order("created_at", desc=True)
 
     if subject != 'All':
@@ -100,28 +308,44 @@ def fetch_projects(query, subject, level, sort_by):
         db_query = db_query.ilike("title", f"%{query}%")
     return db_query.execute().data
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=300)
 def fetch_leaderboard():
+    """Fetch the top 50 users by XP for the leaderboard."""
     response = supabase.table("users").select("username, xp").order("xp", desc=True).limit(50).execute()
     return response.data
 
+@st.cache_data(ttl=60)
+def fetch_user_votes(username):
+    """Fetch all votes the given user has cast.
+    Returns a dict mapping project_id → {vote: int, xp_awarded: bool}.
+    """
+    response = supabase.table("project_likes").select("project_id, vote, xp_awarded").eq("username", username).execute()
+    return {r['project_id']: {'vote': r.get('vote', 1), 'xp_awarded': r.get('xp_awarded', False)} for r in response.data}
+
 # ----------------------------------------------------------------------
-# DataManager class (with improvements – no OAuth changes needed inside)
+# DataManager
+# Central class that encapsulates all database operations:
+#   - User authentication (signup, login)
+#   - Note publishing (add_note) with file upload and XP rewards
+#   - Voting system (vote_note) with XP grant/deduct logic
+#   - Data retrieval wrappers (get_projects, get_leaderboard, get_user_votes)
 # ----------------------------------------------------------------------
 class DataManager:
     def __init__(self):
         self.bucket_name = BUCKET_NAME
-        if 'user_likes' not in st.session_state:
+        if 'user_votes' not in st.session_state:
             if 'user' in st.session_state and st.session_state.user:
-                st.session_state.user_likes = self.get_user_likes()
+                st.session_state.user_votes = self.get_user_votes()
             else:
-                st.session_state.user_likes = []
-        self.user_likes = st.session_state.user_likes
+                st.session_state.user_votes = {}
+        self.user_votes = st.session_state.user_votes
 
     def hash_password(self, password):
+        """Hash a password with SHA-256 for storage and comparison."""
         return hashlib.sha256(password.encode()).hexdigest()
 
     def signup(self, email, username, password):
+        """Register a new user. Returns (True, user_dict) or (False, error_msg)."""
         try:
             if not (3 <= len(username) <= 36):
                 return False, "Username must be between 3 and 36 characters."
@@ -149,6 +373,7 @@ class DataManager:
             return False, str(e)
 
     def login(self, email, password):
+        """Authenticate user by email + hashed password. Returns (True, user_dict) or (False, error_msg)."""
         try:
             hashed_pw = self.hash_password(password)
             response = supabase.table("users").select("*").eq("email", email).eq("password", hashed_pw).execute()
@@ -158,34 +383,10 @@ class DataManager:
         except Exception as e:
             return False, str(e)
 
-    def sync_google_user(self, email):
-        """Ensures a Google-authenticated user exists in public.users table."""
-        try:
-            res = supabase.table("users").select("*").eq("email", email).execute()
-            if res.data:
-                return res.data[0]
 
-            username = email.split("@")[0]
-            check = supabase.table("users").select("username").eq("username", username).execute()
-            if check.data:
-                import random
-                username = f"{username}{random.randint(100, 999)}"
-
-            new_user = {
-                "email": email,
-                "username": username,
-                "password": "GOOGLE_AUTH_USER",
-                "xp": 0
-            }
-            res = supabase.table("users").insert(new_user).execute()
-            if res.data:
-                return res.data[0]
-            return None
-        except Exception as e:
-            print(f"Sync Google User Error: {e}")
-            return None
 
     def refresh_user(self):
+        """Re-fetch the current user's data from the database to get updated XP, etc."""
         if 'user' in st.session_state and st.session_state.user:
             try:
                 username = st.session_state.user['username']
@@ -195,18 +396,19 @@ class DataManager:
             except Exception as e:
                 print(f"Error refreshing user: {e}")
 
-    def get_user_likes(self):
+    def get_user_votes(self):
         if 'user' not in st.session_state or not st.session_state.user:
-            return []
+            return {}
         try:
-            username = st.session_state.user['username']
-            response = supabase.table("project_likes").select("project_id").eq("username", username).execute()
-            return [r['project_id'] for r in response.data]
+            return fetch_user_votes(st.session_state.user['username'])
         except Exception as e:
-            print(f"Error fetching user likes: {e}")
-            return []
+            print(f"Error fetching user votes: {e}")
+            return {}
 
     def add_note(self, title, subject, level, description, uploaded_file):
+        """Publish a new note. Uploads the file to Supabase Storage,
+        inserts the note into the 'projects' table, and awards +15 XP.
+        """
         if 'user' not in st.session_state or not st.session_state.user:
             return False
 
@@ -243,7 +445,7 @@ class DataManager:
             "file": file_url,
             "file_name": file_name,
             "file_size": file_size,
-            "likes": 0
+            "votes": 0
         }
 
         try:
@@ -262,36 +464,78 @@ class DataManager:
             st.error(f"Database insert failed: {e}")
             return False
 
-    def like_note(self, note_id, current_likes, note_author):
+    def vote_note(self, note_id, current_score, note_author, vote_value):
+        """Vote on a note. vote_value: +1 (upvote) or -1 (downvote).
+        XP rules: Upvote grants +10 XP. Downvote-after-upvote deducts 10 XP.
+        First downvote (no prior vote) does not affect XP.
+        """
         if 'user' not in st.session_state or not st.session_state.user:
-            st.warning("You must be logged in to like.")
+            st.warning("You must be logged in to vote.")
             return False
 
-        if note_id in st.session_state.user_likes:
-            return False
+        current_username = st.session_state.user['username']
+        existing = st.session_state.user_votes.get(note_id)
 
         try:
-            current_username = st.session_state.user['username']
-            supabase.table("project_likes").insert({
-                "project_id": note_id,
-                "username": current_username
-            }).execute()
-            supabase.table("projects").update({"likes": current_likes + 1}).eq("id", note_id).execute()
+            if existing is None:
+                # First vote on this post
+                xp_awarded = False
+                if vote_value == 1:
+                    # Award XP to author on first upvote
+                    author_data = supabase.table("users").select("xp").eq("username", note_author).execute()
+                    if author_data.data:
+                        new_xp = author_data.data[0]['xp'] + 10
+                        supabase.table("users").update({"xp": new_xp}).eq("username", note_author).execute()
+                    xp_awarded = True
+                
+                supabase.table("project_likes").insert({
+                    "project_id": note_id,
+                    "username": current_username,
+                    "vote": vote_value,
+                    "xp_awarded": xp_awarded
+                }).execute()
+                supabase.table("projects").update({"votes": current_score + vote_value}).eq("id", note_id).execute()
+                st.session_state.user_votes[note_id] = {'vote': vote_value, 'xp_awarded': xp_awarded}
 
-            author_data = supabase.table("users").select("xp").eq("username", note_author).execute()
-            if author_data.data:
-                current_xp = author_data.data[0]['xp']
-                new_xp = current_xp + 10
-                supabase.table("users").update({"xp": new_xp}).eq("username", note_author).execute()
+            elif existing['vote'] == vote_value:
+                # Same vote again – no-op
+                return False
+            else:
+                # Toggle: changing vote direction (swing = 2 * vote_value)
+                already_awarded = existing.get('xp_awarded', False)
+                
+                if vote_value == 1:
+                    # Switching TO upvote → always grant +10 XP
+                    author_data = supabase.table("users").select("xp").eq("username", note_author).execute()
+                    if author_data.data:
+                        new_xp = author_data.data[0]['xp'] + 10
+                        supabase.table("users").update({"xp": new_xp}).eq("username", note_author).execute()
+                    new_xp_awarded = True
+                elif vote_value == -1 and already_awarded:
+                    # Switching TO downvote after upvote → deduct the 10 XP
+                    author_data = supabase.table("users").select("xp").eq("username", note_author).execute()
+                    if author_data.data:
+                        new_xp = max(0, author_data.data[0]['xp'] - 10)
+                        supabase.table("users").update({"xp": new_xp}).eq("username", note_author).execute()
+                    new_xp_awarded = False
+                else:
+                    new_xp_awarded = already_awarded
 
-            st.session_state.user_likes.append(note_id)
+                supabase.table("project_likes").update({
+                    "vote": vote_value,
+                    "xp_awarded": new_xp_awarded
+                }).eq("project_id", note_id).eq("username", current_username).execute()
+                supabase.table("projects").update({"votes": current_score + (2 * vote_value)}).eq("id", note_id).execute()
+                st.session_state.user_votes[note_id] = {'vote': vote_value, 'xp_awarded': new_xp_awarded}
+
             fetch_projects.clear()
             fetch_leaderboard.clear()
+            fetch_user_votes.clear()
             if current_username == note_author:
                 self.refresh_user()
             return True
         except Exception as e:
-            st.error(f"Like failed: {e}")
+            st.error(f"Vote failed: {e}")
             return False
 
     def get_projects(self, query="", subject='All', level='All', sort_by="Recent"):
@@ -311,7 +555,9 @@ class DataManager:
 data = DataManager()
 
 # ----------------------------------------------------------------------
-# CSS Styling (unchanged)
+# CSS Styling
+# Defines the visual appearance for note cards, buttons, leaderboard
+# rows, form inputs, and tab labels. Injected via st.markdown.
 # ----------------------------------------------------------------------
 st.markdown("""
     <style>
@@ -324,7 +570,7 @@ st.markdown("""
         padding: 24px !important;
         color: #000000 !important;
         display: flex;
-        height: 250px;
+        height: 300px;
         flex-direction: column;
         justify-content: flex-start;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
@@ -357,13 +603,13 @@ st.markdown("""
     .note-description {
         color: #000000 !important;
         font-size: 1rem;
-        line-height: 1.5;
-        max-height: 4.5em;
-        display: -webkit-box;
-        -webkit-line-clamp: 3;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        line-height: 1.5 !important;
+        max-height: 4.5em !important;
+        display: -webkit-box !important;
+        -webkit-line-clamp: 3 !important;
+        -webkit-box-orient: vertical !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
         margin-bottom: 8px;
         word-break: break-all;
         overflow-wrap: break-word;
@@ -402,133 +648,50 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ----------------------------------------------------------------------
-# DYNAMIC BASE URL DETECTION (fixes Google OAuth redirect)
+# Session Persistence & Auto-Login
+# Saves/restores the logged-in user to auth_token.json so users
+# stay logged in across browser reloads and app restarts.
 # ----------------------------------------------------------------------
-def get_base_url():
-    """
-    Returns the base URL of the current Streamlit app.
-    Works both locally and on Streamlit Cloud.
-    """
+
+
+def save_session():
+    """Save user session data to disk for auto-login on next visit."""
     try:
-        headers = st.context.headers
-        host = headers.get("host", "localhost:8501")
-        # Protocol: use X-Forwarded-Proto if behind a proxy, else default to https
-        proto = headers.get("x-forwarded-proto", "https").split(",")[0].strip()
-        return f"{proto}://{host}"
-    except:
-        # Fallback for older Streamlit versions or local testing
-        return "http://localhost:8501"
-
-# ----------------------------------------------------------------------
-# Authentication state
-# ----------------------------------------------------------------------
-if 'user' not in st.session_state:
-    st.session_state.user = None
-
-# ----------------------------------------------------------------------
-# GOOGLE OAUTH CALLBACK HANDLER (with improved error handling)
-# ----------------------------------------------------------------------
-params = st.query_params
-
-# Check for explicit OAuth errors from Google
-if "error" in params:
-    error_code = params.get("error")
-    error_msg = params.get("error_description", "No description provided.")
-    st.error(f"Google OAuth Error: {error_code}")
-    st.info(f"Details: {error_msg}")
-    st.query_params.clear()
-
-if "code" in params:
-    try:
-        # 1. Get code from URL (ensure it's a string)
-        auth_code = params.get("code")
-        if isinstance(auth_code, list): auth_code = auth_code[0]
-        
-        # 2. Find verifier in session state
-        code_verifier = None
-        # Look for any key that looks like a verifier
-        for key in st.session_state.keys():
-            if "code-verifier" in key or "code_verifier" in key:
-                code_verifier = st.session_state[key]
-                break
-        
-        # 3. Exchange the OAuth code for a session
-        # We try to pass both auth_code and code_verifier explicitly
-        # Some library versions expect a dict, some positional. We'll use a dict.
-        exchange_params = {
-            "auth_code": auth_code,
-            "code_verifier": code_verifier
-        }
-        
-        # If no verifier found, try passing just the code string as fallback
-        if not code_verifier:
-            try:
-                session = supabase.auth.exchange_code_for_session(auth_code)
-            except:
-                session = supabase.auth.exchange_code_for_session(exchange_params)
-        else:
-            session = supabase.auth.exchange_code_for_session(exchange_params)
-        if session and session.user and session.user.email:
-            app_user = data.sync_google_user(session.user.email)
-            if app_user:
-                st.session_state.user = app_user
-                st.session_state.user_likes = data.get_user_likes()
-                st.success(f"Signed in as {app_user['username']} via Google!")
-                st.query_params.clear()
-                st.rerun()
-            else:
-                st.error("Google login succeeded but user profile could not be created.")
-        else:
-            st.error("Google login succeeded but no user session was returned.")
+        session_data = {}
+        if 'user' in st.session_state and st.session_state.user:
+            session_data["custom_user"] = st.session_state.user
+        with open(SESSION_FILE, "w") as f:
+            json.dump(session_data, f)
     except Exception as e:
-        st.error(f"Google callback error: {e}")
-        st.exception(e)  # Show full traceback for debugging
-    finally:
-        # Always clear the code to prevent reprocessing on refresh
-        if "code" in st.query_params:
-            st.query_params.clear()
+        print(f"Error saving session: {e}")
+
+def restore_session():
+    """Restore user session from disk if available."""
+    if st.session_state.user is not None:
+        return # User is already logged in, no need to restore
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "r") as f:
+                session_data = json.load(f)
+            if "custom_user" in session_data:
+                st.session_state.user = session_data["custom_user"]
+                st.session_state.user_votes = data.get_user_votes()
+                print(f"Session restored for {st.session_state.user['username']}")
+    except Exception as e:
+        print(f"Session restoration error: {e}")
+
+# Attempt to restore session on app startup
+restore_session()
+
 
 # ----------------------------------------------------------------------
-# LOGIN PAGE (if not authenticated)
+# LOGIN PAGE (shown when user is not authenticated)
+# Provides Email/Password sign-in and sign-up forms.
 # ----------------------------------------------------------------------
 if st.session_state.user is None:
     st.markdown('<div class="main-header" style="text-align: center;">🏫 SST Study Sphere</div>', unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>Please Sign In to Continue</h3>", unsafe_allow_html=True)
 
-    # ---------- Google Sign-In Button (Custom HTML to force same tab) ----------
-    try:
-        redirect_url = get_base_url()
-        # DEBUG: Show the exact redirect URL being used
-        st.caption(f"Debug: Redirecting detailed internal to: `{redirect_url}`")
-        
-        auth_response = supabase.auth.sign_in_with_oauth({
-            "provider": "google",
-            "options": {
-                "redirect_to": redirect_url
-            }
-        })
-        if auth_response.url:
-            # We use custom HTML because st.link_button defaults to target="_blank"
-            st.markdown(f"""
-                <a href="{auth_response.url}" target="_self" style="
-                    display: block;
-                    width: 100%;
-                    background-color: #4285F4;
-                    color: white;
-                    text-align: center;
-                    padding: 10px;
-                    text-decoration: none;
-                    border-radius: 8px;
-                    font-weight: 600;
-                    margin-bottom: 20px;
-                ">🔵 Sign in with Google</a>
-            """, unsafe_allow_html=True)
-        else:
-            st.error("Failed to start Google sign‑in – no authorization URL returned.")
-    except Exception as e:
-        st.error(f"Could not load Google Sign‑In: {e}")
-
-    # ---------- Email/Password Tabs ----------
     tab_login, tab_signup = st.tabs(["Sign In", "Sign Up"])
 
     with tab_login:
@@ -543,7 +706,8 @@ if st.session_state.user is None:
                     success, res = data.login(email, password)
                     if success:
                         st.session_state.user = res
-                        st.session_state.user_likes = data.get_user_likes()
+                        st.session_state.user_votes = data.get_user_votes()
+                        save_session() # Save for auto-login
                         st.success(f"Welcome back, {res['username']}!")
                         time.sleep(1)
                         st.rerun()
@@ -566,7 +730,8 @@ if st.session_state.user is None:
                     success, res = data.signup(new_email, new_user, new_pass)
                     if success:
                         st.session_state.user = res
-                        st.session_state.user_likes = []
+                        st.session_state.user_votes = {}
+                        save_session() # Save for auto-login
                         st.success("Account created successfully! Logging in...")
                         time.sleep(1)
                         st.rerun()
@@ -574,95 +739,248 @@ if st.session_state.user is None:
                         st.error(res)
 
 else:
-    # ------------------------------------------------------------------
-    # MAIN APP (Logged In)
-    # ------------------------------------------------------------------
-    data.refresh_user()
+    # ==================================================================
+    # MAIN APP (shown after successful login)
+    # Contains three tabs: Notes Forum, Leaderboard, and AI Tutor.
+    # ==================================================================
+    data.refresh_user()  # Sync latest user data (XP, level) from DB
 
+    # ---------- Top Bar: Branding, user info, logout ----------
     with st.container():
-        c1, c2, c3 = st.columns([3, 1, 0.5])
-        c1.markdown('<div class="main-header">🏫 SST Study Sphere</div>', unsafe_allow_html=True)
+        col_brand, col_user_info, col_logout = st.columns([3, 1, 0.5])
+        col_brand.markdown('<div class="main-header">🏫 SST Study Sphere</div>', unsafe_allow_html=True)
 
         xp = st.session_state.user['xp']
         level = calculate_level(xp)
         next_level_xp = calculate_next_level_xp(level)
 
-        c2.markdown(f"<div style='font-size: 120%;'>Welcome, {st.session_state.user['username']} | <b>Level {level}</b> ({xp}/{next_level_xp} XP)</div>", unsafe_allow_html=True)
-        if c3.button("Logout"):
+        col_user_info.markdown(f"<div style='font-size: 120%;'>Welcome, {st.session_state.user['username']} | <b>Level {level}</b> ({xp}/{next_level_xp} XP)</div>", unsafe_allow_html=True)
+        if col_logout.button("Logout"):
             st.session_state.user = None
-            st.session_state.user_likes = []
+            st.session_state.user_votes = {}
+            # Clear persistent session file on logout
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
             st.rerun()
+
 
     tab1, tab2, tab3 = st.tabs(["📚 Notes Forum", "🏆 Leaderboard", "🤖 AI Tutor"])
 
-    # ---------- Notes Forum ----------
+    # ==========================================================
+    # TAB 1: Notes Forum
+    # Two modes: Focus View (single post) or Grid View (browse all)
+    # ==========================================================
     with tab1:
-        with st.expander("⬆️ Upload New Note"):
-            with st.form("upload_form", clear_on_submit=True):
-                u_title = st.text_input("Title")
-                u_file = st.file_uploader("Upload PDF/Video", type=['pdf', 'mp4', 'png', 'jpg'])
+        # Initialize the focused note tracker (None = grid view)
+        if 'focused_note_id' not in st.session_state:
+            st.session_state.focused_note_id = None
 
-                c_a, c_b = st.columns(2)
-                u_subject = c_a.selectbox("Subject", ['English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers'])
-                u_level = c_b.selectbox("Level", ['Sec 1', 'Sec 2', 'Sec 3', 'Sec 4'])
+        if st.session_state.focused_note_id is not None:
+            # ---------- Focus View: Full post detail ----------
+            # Find the focused note
+            focused_id = st.session_state.focused_note_id
+            # Fetch fresh data for this note
+            try:
+                note_data = supabase.table("projects").select("*").eq("id", focused_id).execute().data
+            except:
+                note_data = []
 
-                u_desc = st.text_area("Description")
+            if note_data:
+                note = note_data[0]
+                score = note.get('votes', 0)
+                user_vote_info = st.session_state.user_votes.get(note['id'])
+                current_vote = user_vote_info['vote'] if user_vote_info else 0
 
-                if st.form_submit_button("Post Note (+15 XP)"):
-                    if u_title and u_desc:
-                        with st.spinner("Publishing..."):
-                            success = data.add_note(u_title, u_subject, u_level, u_desc, u_file)
-                        if success:
-                            st.success("Note Published! You gained 15 XP.")
-                            time.sleep(1)
-                            st.rerun()
-                    else:
-                        st.warning("Please enter a title and description.")
+                if st.button("← Back to Notes"):
+                    st.session_state.focused_note_id = None
+                    st.rerun()
 
-        col_search, col_sub, col_lvl, col_sort = st.columns([3, 1, 1, 1])
-        search_query = col_search.text_input("Search", placeholder="Search notes...")
-        subject_filter = col_sub.selectbox("Subject Filter", ['All', 'English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers'])
-        level_filter = col_lvl.selectbox("Level Filter", ['All', 'Sec 1', 'Sec 2', 'Sec 3', 'Sec 4'])
-        sort_option = col_sort.selectbox("Sort By", ["Recent", "Most Likes"])
+                st.markdown(f"## {note['title']}")
+                st.markdown(f"*By **{note['author']}*** — {note['subject']} • {', '.join(note['level']) if note['level'] else ''}")
 
-        notes = data.get_projects(search_query, subject_filter, level_filter, sort_option)
+                # Vote score
+                if score > 0:
+                    score_color = "#22c55e"
+                    score_text = f"+{score}"
+                elif score < 0:
+                    score_color = "#ef4444"
+                    score_text = str(score)
+                else:
+                    score_color = "#888"
+                    score_text = "0"
+                st.markdown(f"**Votes:** <span style='color: {score_color}; font-weight: bold; font-size: 1.2rem;'>{score_text}</span>", unsafe_allow_html=True)
 
-        if not notes:
-            st.info("No notes found.")
+                st.markdown("---")
+                st.markdown(note['description'] or "No description provided.")
+                st.markdown("---")
+
+                if note['file'] and note['file'] != "#":
+                    f_name = note.get('file_name') or "File"
+                    download_url = f"{note['file']}?download="
+                    st.link_button(f"⬇️ Download {f_name}", download_url, use_container_width=False)
+
+                # Vote buttons
+                v_col1, v_col2, v_col3 = st.columns([1, 1, 3])
+                up_label = "✅ Upvoted" if current_vote == 1 else "▲ Upvote"
+                down_label = "❌ Downvoted" if current_vote == -1 else "▼ Downvote"
+
+                if v_col1.button(up_label, key=f"up_{note['id']}", disabled=(current_vote == 1), use_container_width=True):
+                    if data.vote_note(note['id'], score, note['author'], 1):
+                        st.rerun()
+
+                if v_col2.button(down_label, key=f"dn_{note['id']}", disabled=(current_vote == -1), use_container_width=True):
+                    if data.vote_note(note['id'], score, note['author'], -1):
+                        st.rerun()
+            else:
+                st.warning("Note not found.")
+                if st.button("← Back to Notes"):
+                    st.session_state.focused_note_id = None
+                    st.rerun()
+
         else:
-            for i in range(0, len(notes), 3):
-                row_notes = notes[i:i+3]
-                cols = st.columns(3)
-                for j in range(3):
-                    with cols[j]:
-                        if j < len(row_notes):
-                            note = row_notes[j]
-                            st.markdown(f"""
-                                <div class="note-card">
-                                    <h4>{note['title']}</h4>
-                                    <div class="note-author">By {note['author']}</div>
-                                    <div class="note-tag">{note['subject']} • {", ".join(note["level"]) if note["level"] else ""}</div>
-                                    <div class="note-description">{note['description'] or "No description provided."}</div>
-                                    <div style="margin-top: 0px;">
-                            """, unsafe_allow_html=True)
+            # ---------- Grid View: Browse & upload notes ----------
 
-                            if note['file'] and note['file'] != "#":
-                                f_name = note.get('file_name') or "File"
-                                download_url = f"{note['file']}?download="
-                                st.link_button(f"⬇️ Download {f_name}", download_url, use_container_width=True)
+            # ····· Upload Form ·····
+            with st.expander("⬆️ Upload New Note", expanded=True):
+                # initialize session state for form clearing if not exists
+                if "upload_key" not in st.session_state:
+                    st.session_state.upload_key = 0
+                
+                # We use a key-based approach to clear the form manually
+                def clear_form():
+                    st.session_state.upload_key += 1
+                    st.session_state.ai_subject = "English"
+                    st.session_state.ai_level = "Sec 1"
 
-                            has_liked = note['id'] in st.session_state.user_likes
-                            btn_text = f"❤️ {note['likes']} Like" if not has_liked else f"💖 {note['likes']} Liked"
+                if 'ai_subject' not in st.session_state: st.session_state.ai_subject = "English"
+                if 'ai_level' not in st.session_state: st.session_state.ai_level = "Sec 1"
+                
+                with st.form(key=f"upload_form_{st.session_state.upload_key}", clear_on_submit=False):
+                    note_title = st.text_input("Title")
+                    u_file = st.file_uploader("Upload PDF/Video", type=['pdf', 'mp4', 'png', 'jpg'])
+                    
+                    subjects = ['English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers']
+                    levels = ['Sec 1', 'Sec 2', 'Sec 3', 'Sec 4']
 
-                            if st.button(btn_text, key=f"like_btn_{note['id']}", disabled=has_liked, use_container_width=True):
-                                if data.like_note(note['id'], note['likes'], note['author']):
-                                    st.rerun()
+                    # Pre-select the AI-suggested subject/level if available
+                    subject_index = subjects.index(st.session_state.ai_subject) if st.session_state.ai_subject in subjects else 0
+                    level_index = levels.index(st.session_state.ai_level) if st.session_state.ai_level in levels else 0
 
-                            st.markdown('</div></div>', unsafe_allow_html=True)
+                    col_subject, col_level = st.columns(2)
+                    note_subject = col_subject.selectbox("Subject", subjects, index=subject_index)
+                    note_level = col_level.selectbox("Level", levels, index=level_index)
+
+                    note_description = st.text_area("Description")
+                    
+                    # Button: ask AI to detect Subject & Level from content
+                    if st.form_submit_button("Analyze & Suggest Tags"):
+                        if not note_description and not u_file:
+                            st.warning("Please upload a file or enter a description first.")
                         else:
-                            st.empty()
+                            with st.spinner("AI is analyzing content..."):
+                                file_bytes = u_file.getvalue() if u_file else None
+                                file_mime = u_file.type if u_file else None
+                                suggested_subject, suggested_level, is_suitable = get_ai_tagging(note_description, file_bytes, file_mime)
 
-    # ---------- Leaderboard ----------
+                            if not is_suitable:
+                                st.session_state.ai_result = {"suitability": False, "subject": None, "level": None}
+                            else:
+                                st.session_state.ai_result = {"suitability": True, "subject": suggested_subject, "level": suggested_level}
+                    
+                    # Show results OUTSIDE the Analyze button logic but INSIDE the form
+                    if 'ai_result' in st.session_state:
+                        res = st.session_state.ai_result
+                        if not res["suitability"]:
+                            st.warning("⚠️ Warning: AI detected that this post may not be suitable for this site (e.g. off-topic or inappropriate). Please ensure you are posting study-related content.")
+                        elif res["subject"] and res["level"]:
+                            st.info(f"AI Suggestion: Subject: **{res['subject']}**, Level: **{res['level']}**")
+                            if st.form_submit_button("✅ Apply Suggested Tags"):
+                                st.session_state.ai_subject = res["subject"]
+                                st.session_state.ai_level = res["level"]
+                                st.success("Suggestion applied! Click 'Post Note' to finish.")
+                                time.sleep(1)
+                                st.rerun()
+
+                    # Button: publish the note to the forum
+                    if st.form_submit_button("Post Note (+15 XP)"):
+                        if note_title and note_description:
+                            with st.spinner("Publishing..."):
+                                success = data.add_note(note_title, note_subject, note_level, note_description, u_file)
+                            if success:
+                                st.success("Note Published! You gained 15 XP.")
+                                time.sleep(1)
+                                clear_form()  # Reset form fields for next upload
+                                st.rerun()
+                        else:
+                            st.warning("Please enter a title and description.")
+
+            # ····· Search & Filter Controls ·····
+            col_search, col_subject_filter, col_level_filter, col_sort = st.columns([3, 1, 1, 1])
+            search_query = col_search.text_input("Search", placeholder="Search notes...")
+            subject_filter = col_subject_filter.selectbox("Subject Filter", ['All', 'English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers'])
+            level_filter = col_level_filter.selectbox("Level Filter", ['All', 'Sec 1', 'Sec 2', 'Sec 3', 'Sec 4'])
+            sort_option = col_sort.selectbox("Sort By", ["Recent", "Most Votes"])
+
+            # ····· Note Cards Grid (3 columns) ·····
+            notes = data.get_projects(search_query, subject_filter, level_filter, sort_option)
+
+            if not notes:
+                st.info("No notes found.")
+            else:
+                for i in range(0, len(notes), 3):
+                    row_notes = notes[i:i+3]
+                    cols = st.columns(3)
+                    for j in range(3):
+                        with cols[j]:
+                            if j < len(row_notes):
+                                note = row_notes[j]
+                                score = note.get('votes', 0)
+
+                                # Color the vote score: green (+), red (-), gray (0)
+                                if score > 0:
+                                    score_display = f"<span style='color: #22c55e; font-weight: bold;'>+{score}</span>"
+                                elif score < 0:
+                                    score_display = f"<span style='color: #ef4444; font-weight: bold;'>{score}</span>"
+                                else:
+                                    score_display = f"<span style='font-weight: bold;'>0</span>"
+
+                                # Auto-detect file type tag from the uploaded file extension
+                                uploaded_name = note.get('file_name') or ""
+                                if uploaded_name:
+                                    file_ext = uploaded_name.rsplit('.', 1)[-1].lower() if '.' in uploaded_name else ""
+                                    if file_ext == 'pdf':
+                                        file_tag = "📄 PDF"
+                                    elif file_ext in ('mp4', 'mov', 'avi'):
+                                        file_tag = "🎬 Video"
+                                    elif file_ext in ('mp3', 'wav', 'ogg', 'm4a'):
+                                        file_tag = "🎙️ Voice"
+                                    elif file_ext in ('png', 'jpg', 'jpeg', 'gif'):
+                                        file_tag = "🖼️ Image"
+                                    else:
+                                        file_tag = f"📎 {file_ext.upper()}"
+                                else:
+                                    file_tag = "📭 No File"
+
+                                st.markdown(f"""
+                                    <div class="note-card">
+                                        <h4>{note['title']}</h4>
+                                        <div class="note-author">By {note['author']}</div>
+                                        <div class="note-tag">{note['subject']} • {", ".join(note["level"]) if note["level"] else ""} • {file_tag}</div>
+                                        <div class="note-description">{note['description'] or "No description provided."}</div>
+                                        <div style="margin-top: 4px; font-size: 0.9rem;">Votes: {score_display}</div>
+                                    </div>
+                                """, unsafe_allow_html=True)
+
+                                if st.button("📖 View Full Post", key=f"view_{note['id']}", use_container_width=True):
+                                    st.session_state.focused_note_id = note['id']
+                                    st.rerun()
+                            else:
+                                st.empty()
+
+    # ==========================================================
+    # TAB 2: Leaderboard
+    # Ranks users by XP, showing their level and total XP.
+    # ==========================================================
     with tab2:
         st.header("Leaderboard 🏆")
         leaderboard = data.get_leaderboard()
@@ -672,17 +990,35 @@ else:
             icon = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
 
             with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([1, 4, 1.5, 1.5])
-                c1.markdown(f'<div class="leaderboard-rank">{icon}</div>', unsafe_allow_html=True)
-                c2.markdown(f'<div class="leaderboard-row"><b>{user_row["username"]}</b></div>', unsafe_allow_html=True)
+                col_rank, col_name, col_lvl, col_xp = st.columns([1, 4, 1.5, 1.5])
+                col_rank.markdown(f'<div class="leaderboard-rank">{icon}</div>', unsafe_allow_html=True)
+                col_name.markdown(f'<div class="leaderboard-row"><b>{user_row["username"]}</b></div>', unsafe_allow_html=True)
 
-                u_xp = user_row["xp"]
-                u_lvl = calculate_level(u_xp)
+                user_xp = user_row["xp"]
+                user_level = calculate_level(user_xp)
 
-                c3.markdown(f'<div class="leaderboard-row">Lvl {u_lvl}</div>', unsafe_allow_html=True)
-                c4.markdown(f'<div class="leaderboard-row">{u_xp} XP</div>', unsafe_allow_html=True)
+                col_lvl.markdown(f'<div class="leaderboard-row">Lvl {user_level}</div>', unsafe_allow_html=True)
+                col_xp.markdown(f'<div class="leaderboard-row">{user_xp} XP</div>', unsafe_allow_html=True)
 
-    # ---------- AI Tutor (placeholder) ----------
+    # ==========================================================
+    # TAB 3: AI Study Buddy
+    # Users pick a subject and type a topic. The AI fetches
+    # relevant notes from the forum and generates a study guide.
+    # ==========================================================
     with tab3:
         st.header("AI Study Buddy 🤖")
-        st.write("Coming soon...")
+        st.markdown("Type in a subject and topic, and I'll compile materials from the notes for you!")
+
+        col_ai_subject, col_ai_topic = st.columns([1, 2])
+        ai_subject = col_ai_subject.selectbox("Choose Subject", ['English', 'Chinese', 'Malay', 'Tamil', 'Math', 'Physics', 'Chemistry', 'Biology', 'Computing', 'Biotechnology', 'Design Studies', 'Electronics', 'Geography', 'History', 'Social Studies', 'CCE', 'Changemakers'], key="sb_sub")
+        ai_topic = col_ai_topic.text_input("What do you want to study? (e.g. 'Kinematics')", key="sb_top")
+
+        if st.button("Compile Study Guide"):
+            if not ai_topic:
+                st.warning("Please enter a topic.")
+            else:
+                with st.spinner(f"Reading notes and compiling guide for {ai_topic}..."):
+                    study_guide = ai_study_buddy(ai_topic, ai_subject)
+                    st.markdown("---")
+                    st.markdown(study_guide)
+                    st.success("Compilation complete!")
