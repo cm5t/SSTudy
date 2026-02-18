@@ -56,10 +56,31 @@ st.set_page_config(page_title="SST Study Sphere", page_icon="🏫", layout="wide
 # Persistent Session Storage
 # Saves and loads user session data to auth_token.json for auto-login.
 # ----------------------------------------------------------------------
-import os
-import json
+import hmac
+import datetime
+import extra_streamlit_components as stx
 
-SESSION_FILE = "auth_token.json"
+# initialize Cookie Manager
+cookie_manager = stx.CookieManager()
+
+COOKIE_KEY = st.secrets.get("COOKIE_SIGNING_KEY", "default-key").encode()
+
+def sign_data(data: str) -> str:
+    """Sign data with HMAC-SHA256."""
+    msg = data.encode()
+    signature = hmac.new(COOKIE_KEY, msg, hashlib.sha256).hexdigest()
+    return f"{data}.{signature}"
+
+def verify_data(signed_data: str) -> str | None:
+    """Verify signed data. Returns original data if valid, else None."""
+    try:
+        data, signature = signed_data.rsplit('.', 1)
+        expected_signature = hmac.new(COOKIE_KEY, data.encode(), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(signature, expected_signature):
+            return data
+        return None
+    except:
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -661,34 +682,46 @@ st.markdown("""
 # ----------------------------------------------------------------------
 
 
-def save_session():
-    """Save user session data to disk for auto-login on next visit."""
+def save_session_cookie(user_data):
+    """Save user session to a signed cookie."""
     try:
-        session_data = {}
-        if 'user' in st.session_state and st.session_state.user:
-            session_data["custom_user"] = st.session_state.user
-        with open(SESSION_FILE, "w") as f:
-            json.dump(session_data, f)
+        username = user_data['username']
+        signed_username = sign_data(username)
+        # Expires in 14 days
+        expires = datetime.datetime.now() + datetime.timedelta(days=14)
+        cookie_manager.set('auth_token', signed_username, expires_at=expires)
     except Exception as e:
-        print(f"Error saving session: {e}")
+        print(f"Error saving session cookie: {e}")
 
-def restore_session():
-    """Restore user session from disk if available."""
+def load_session_from_cookie():
+    """Restore user session from cookie if available."""
     if st.session_state.user is not None:
-        return # User is already logged in, no need to restore
+        return # User is already logged in
+
     try:
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE, "r") as f:
-                session_data = json.load(f)
-            if "custom_user" in session_data:
-                st.session_state.user = session_data["custom_user"]
-                st.session_state.user_votes = data.get_user_votes()
-                print(f"Session restored for {st.session_state.user['username']}")
+        # Get all cookies (stx.CookieManager caches them)
+        cookies = cookie_manager.get_all()
+        signed_token = cookies.get('auth_token')
+        
+        if signed_token and isinstance(signed_token, str):
+            username = verify_data(signed_token)
+            if username:
+                # Fetch full user data from DB
+                # Note: We need to access the table directly or use a helper
+                # Since 'supabase' global is available:
+                response = supabase.table("users").select("*").eq("username", username).execute()
+                if response.data:
+                    st.session_state.user = response.data[0]
+                    st.session_state.user_votes = data.get_user_votes()
+                    # print(f"Session restored for {username}")
+            else:
+                # Invalid signature, maybe clear it?
+                pass
     except Exception as e:
         print(f"Session restoration error: {e}")
 
 # Attempt to restore session on app startup
-restore_session()
+load_session_from_cookie()
 
 
 # ----------------------------------------------------------------------
@@ -714,7 +747,7 @@ if st.session_state.user is None:
                     if success:
                         st.session_state.user = res
                         st.session_state.user_votes = data.get_user_votes()
-                        save_session() # Save for auto-login
+                        save_session_cookie(res) # Save for auto-login
                         st.success(f"Welcome back, {res['username']}!")
                         time.sleep(1)
                         st.rerun()
@@ -738,7 +771,7 @@ if st.session_state.user is None:
                     if success:
                         st.session_state.user = res
                         st.session_state.user_votes = {}
-                        save_session() # Save for auto-login
+                        save_session_cookie(res) # Save for auto-login
                         st.success("Account created successfully! Logging in...")
                         time.sleep(1)
                         st.rerun()
@@ -765,9 +798,8 @@ else:
         if col_logout.button("Logout"):
             st.session_state.user = None
             st.session_state.user_votes = {}
-            # Clear persistent session file on logout
-            if os.path.exists(SESSION_FILE):
-                os.remove(SESSION_FILE)
+            # Clear persistent session cookie on logout
+            cookie_manager.delete('auth_token')
             st.rerun()
 
 
